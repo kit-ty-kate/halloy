@@ -16,7 +16,7 @@ mod url;
 mod widget;
 mod window;
 
-use std::collections::HashSet;
+use std::collections::{HashSet, VecDeque};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 use std::{env, mem};
@@ -25,14 +25,16 @@ use appearance::{Theme, theme};
 use chrono::Utc;
 use data::config::{self, Config};
 use data::history::manager::Broadcast;
-use data::history::{self};
 use data::target::{self, Target};
 use data::version::Version;
-use data::{Notification, Server, Url, User, environment, server, version};
+use data::{
+    Notification, Server, Url, User, environment, history, message, server,
+    version,
+};
 use iced::widget::{column, container};
 use iced::{Length, Subscription, Task, padding};
 use screen::{dashboard, help, migration, welcome};
-use tokio::runtime;
+use tokio::{runtime, time};
 use tokio_stream::wrappers::ReceiverStream;
 
 use self::event::{Event, events};
@@ -250,6 +252,7 @@ pub enum Message {
     Window(window::Id, window::Event),
     WindowSettingsSaved(Result<(), window::Error>),
     Logging(Vec<logger::Record>),
+    OnConnect(Server, VecDeque<data::Command>),
 }
 
 impl Halloy {
@@ -618,7 +621,6 @@ impl Halloy {
                             let events = match self.clients.receive(
                                 &server,
                                 message,
-                                &self.config.actions,
                                 &self.config.ctcp,
                             ) {
                                 Ok(events) => events,
@@ -942,19 +944,16 @@ impl Halloy {
                                             &server,
                                         );
                                     }
-                                    data::client::Event::OpenBuffers(targets) => {
-                                        for (target, buffer_action) in targets {
-                                            commands.push(
-                                                dashboard
-                                                    .open_target(
-                                                        server.clone(),
-                                                        target,
-                                                        &mut self.clients,
-                                                        buffer_action,
-                                                        &self.config,
-                                                    )
-                                                    .map(Message::Dashboard),
-                                            );
+                                    data::client::Event::OnConnect(
+                                        on_connect_commands,
+                                    ) => {
+                                        if !on_connect_commands.is_empty() {
+                                            commands.push(Task::done(
+                                                Message::OnConnect(
+                                                    server.clone(),
+                                                    on_connect_commands,
+                                                ),
+                                            ));
                                         }
                                     }
                                 }
@@ -1202,6 +1201,82 @@ impl Halloy {
                         .map(|record| dashboard.record_log(record)),
                 )
                 .map(Message::Dashboard)
+            }
+            Message::OnConnect(server, mut commands) => {
+                let mut tasks = Vec::new();
+
+                let mut delay = 0;
+
+                if let Some(command) = commands.pop_front() {
+                    match command {
+                        data::Command::Irc(command) => {
+                            if let Ok(message) =
+                                message::Encoded::try_from(command)
+                            {
+                                self.clients.send(
+                                    &buffer::Upstream::Server(server.clone()),
+                                    message,
+                                );
+                            }
+                        }
+                        data::Command::Internal(cmd) => match cmd {
+                            data::command::Internal::OpenBuffers(targets) => {
+                                if let Screen::Dashboard(dashboard) =
+                                    &mut self.screen
+                                {
+                                    for target in targets {
+                                        let buffer_action = match target {
+                                            Target::Channel(_) => {
+                                                self.config
+                                                    .actions
+                                                    .buffer
+                                                    .message_channel
+                                            }
+                                            Target::Query(_) => {
+                                                self.config
+                                                    .actions
+                                                    .buffer
+                                                    .message_user
+                                            }
+                                        };
+
+                                        tasks.push(
+                                            dashboard
+                                                .open_target(
+                                                    server.clone(),
+                                                    target,
+                                                    &mut self.clients,
+                                                    buffer_action,
+                                                    &self.config,
+                                                )
+                                                .map(Message::Dashboard),
+                                        );
+                                    }
+                                }
+                            }
+                            // We don't handle hop when called from on_connect.
+                            data::command::Internal::Hop(_, _) => (),
+                            data::command::Internal::Delay(seconds) => {
+                                delay = seconds;
+                            }
+                        },
+                    }
+                }
+
+                if !commands.is_empty() {
+                    if delay > 0 {
+                        tasks.push(Task::perform(
+                            time::sleep(Duration::from_secs(delay)),
+                            move |()| Message::OnConnect(server, commands),
+                        ));
+                    } else {
+                        tasks.push(Task::done(Message::OnConnect(
+                            server, commands,
+                        )));
+                    }
+                }
+
+                Task::batch(tasks)
             }
         }
     }
